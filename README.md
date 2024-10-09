@@ -34,3 +34,8 @@ This is a Discord bot built for human verification using ID documents and selfie
 
 3. Configure environment:
    Replace API tokens and discord token
+
+
+## how to get a ZukiJourney API key?
+
+go to: https://zukijourney.com/
