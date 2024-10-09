@@ -1,0 +1,4 @@
+discord.py==2.0.0
+requests==2.31.0
+logging==0.5.1.2
+sqlite3==0.0.1
