@@ -9,10 +9,10 @@ import string
 from discord import app_commands
 from discord.ext import commands
 from discord.ui import Button, View
+from datetime import datetime, timedelta
 
-# Initialize the API base URL and key
 API_BASE_URL = "https://api.zukijourney.com/v1"
-API_KEY = "ZUKI_JOURNEY_TOKEN"
+API_KEY = "ZUKIJOURNEY_KEY"
 
 conn = sqlite3.connect('verification_settings.db')
 c = conn.cursor()
@@ -24,7 +24,7 @@ except sqlite3.OperationalError:
     pass
 
 try:
-    c.execute("ALTER TABLE settings ADD COLUMN human_verification_enabled BOOLEAN DEFAULT 1")  # Default is 'True'
+    c.execute("ALTER TABLE settings ADD COLUMN human_verification_enabled BOOLEAN DEFAULT 1")
     conn.commit()
 except sqlite3.OperationalError:
     pass
@@ -50,9 +50,21 @@ c.execute('''
 ''')
 conn.commit()
 
+
+c.execute('''CREATE TABLE IF NOT EXISTS cooldowns (
+    user_id INTEGER, 
+    guild_id INTEGER, 
+    command TEXT, 
+    usage_count INTEGER DEFAULT 0, 
+    last_used TIMESTAMP,
+    PRIMARY KEY(user_id, guild_id, command)
+)''')
+conn.commit()
+
+
 logging.basicConfig(
-    filename='verification_logs.log',  # Log file where API requests and responses will be stored
-    level=logging.INFO,  # Log level set to INFO to capture necessary details
+    filename='verification_logs.log',
+    level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 
@@ -61,14 +73,40 @@ intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 # Staff review channel ID (replace this with your actual staff review channel ID)
-STAFF_REVIEW_CHANNEL_ID = 1128232339516960799  # Example channel ID for staff review
-AUTHORIZED_STAFF_IDS = [974368593615659098, 987654321098765432]  # Replace with actual staff member IDs
+STAFF_REVIEW_CHANNEL_ID = 1128232339516960799 
+AUTHORIZED_STAFF_IDS = [974368593615659098, 987654321098765432]
 
 @bot.event
 async def on_ready():
-    await bot.tree.sync()
+    await bot.tree.sync()  # Syncing the slash commands with Discord
     print(f"Logged in as {bot.user}. Commands have been synced.")
     logging.info(f"Logged in as {bot.user}. Commands have been synced.")
+
+
+def check_cooldown(user_id, guild_id, command, cooldown_duration=None):
+    c.execute("SELECT usage_count, last_used FROM cooldowns WHERE user_id=? AND guild_id=? AND command=?", 
+              (user_id, guild_id, command))
+    result = c.fetchone()
+
+    if not result:
+        return False, 0
+
+    usage_count, last_used = result
+    last_used_dt = datetime.strptime(last_used, '%Y-%m-%d %H:%M:%S')
+
+    if cooldown_duration and (datetime.now() - last_used_dt) < cooldown_duration:
+        return True, usage_count
+    return False, usage_count
+
+def update_cooldown(user_id, guild_id, command, usage_count=0):
+    now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    c.execute('''
+        INSERT INTO cooldowns (user_id, guild_id, command, usage_count, last_used)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(user_id, guild_id, command)
+        DO UPDATE SET usage_count=?, last_used=?
+    ''', (user_id, guild_id, command, usage_count, now, usage_count, now))
+    conn.commit()
 
 
 def generate_case_id():
@@ -82,6 +120,7 @@ def call_api(id_image_url, selfie_image_url, country):
 
     current_date = datetime.datetime.now().strftime("%d/%m/%y")
 
+    # The data payload for the API request
     data = {
         "model": "claude-3-opus",
         "messages": [
@@ -165,7 +204,7 @@ class ConfirmView(View):
 @app_commands.describe(country="Country where the ID was issued", id_attachment="Image of your ID", selfie_attachment="A selfie image for face verification")
 async def human_verify(interaction: discord.Interaction, country: str, id_attachment: discord.Attachment, selfie_attachment: discord.Attachment):
     try:
-        c.execute("SELECT verification_channel_id, human_verification_enabled FROM settings WHERE guild_id=?", (interaction.guild.id,))
+        c.execute("SELECT verification_channel_id, verified_role_id, human_verification_enabled FROM settings WHERE guild_id=?", (interaction.guild.id,))
         result = c.fetchone()
 
         if not result:
@@ -177,13 +216,26 @@ async def human_verify(interaction: discord.Interaction, country: str, id_attach
             await interaction.response.send_message(embed=embed, ephemeral=True)
             return
 
-        verification_channel_id, human_verification_enabled = result
+        verification_channel_id, verified_role_id, human_verification_enabled = result
 
-        if not human_verification_enabled:
+        c.execute("SELECT case_id FROM human_verification WHERE user_id=? AND guild_id=?", (interaction.user.id, interaction.guild.id))
+        pending_case = c.fetchone()
+
+        if pending_case:
             embed = discord.Embed(
-                title="⚠️ Human Verification Disabled",
-                description="Human verification is disabled for this server. Please contact an admin if you believe this is incorrect.",
+                title="⚠️ Verification Already Requested",
+                description="You have already requested human verification and must wait for a staff member to accept or deny your request.",
                 color=discord.Color.red()
+            )
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+            return
+
+        verified_role = interaction.guild.get_role(verified_role_id)
+        if verified_role in interaction.user.roles:
+            embed = discord.Embed(
+                title="✅ Already Verified",
+                description="You are already verified and have the verified role.",
+                color=discord.Color.green()
             )
             await interaction.response.send_message(embed=embed, ephemeral=True)
             return
@@ -196,31 +248,6 @@ async def human_verify(interaction: discord.Interaction, country: str, id_attach
             )
             await interaction.response.send_message(embed=embed, ephemeral=True)
             return
-
-        await interaction.response.defer()
-
-        id_image_url = id_attachment.url
-        selfie_image_url = selfie_attachment.url
-
-        logging.info(f"Processing verification for {interaction.user.name} with ID image URL: {id_image_url} and Selfie image URL: {selfie_image_url}")
-
-        case_id = generate_case_id()
-        guild_id = interaction.guild.id
-        guild_name = interaction.guild.name
-        user_id = interaction.user.id
-        username = interaction.user.name
-
-        embed = discord.Embed(
-            title="👤 Human Verification Request",
-            description="By clicking **Yes**, you agree that your document will be stored for up to **72 hours** while the bot development team manually verifies your ID.\n\nDo you wish to proceed?",
-            color=discord.Color.orange()
-        )
-        embed.add_field(name="Country", value=country, inline=True)
-        embed.add_field(name="User", value=interaction.user.mention, inline=True)
-        embed.set_footer(text="Please respond within 60 seconds.")
-
-        view = ConfirmView(id_attachment, selfie_attachment, case_id, user_id, username, guild_id, guild_name, id_image_url, selfie_image_url, country)
-        await interaction.followup.send(embed=embed, view=view)
 
     except Exception as e:
         logging.error(f"An error occurred: {str(e)}")
@@ -371,6 +398,29 @@ async def verify(interaction: discord.Interaction, country: str, id_attachment: 
 
         verification_channel_id, verified_role_id = result
 
+        verified_role = interaction.guild.get_role(verified_role_id)
+        if verified_role in interaction.user.roles:
+            embed = discord.Embed(
+                title="✅ Already Verified",
+                description="You are already verified and have the verified role.",
+                color=discord.Color.green()
+            )
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+            return
+
+        cooldown_duration = timedelta(hours=1)
+        is_on_cooldown, usage_count = check_cooldown(interaction.user.id, interaction.guild.id, "verify", cooldown_duration)
+
+        if is_on_cooldown and usage_count >= 2:
+            time_remaining = cooldown_duration - (datetime.now() - datetime.strptime(last_used, '%Y-%m-%d %H:%M:%S'))
+            embed = discord.Embed(
+                title="⏳ Cooldown Active",
+                description=f"You have used the `/verify` command twice. Please wait for {time_remaining} before trying again.",
+                color=discord.Color.red()
+            )
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+            return
+
         if interaction.channel.id != verification_channel_id:
             embed = discord.Embed(
                 title="⚠️ Wrong Channel",
@@ -493,6 +543,9 @@ async def verify(interaction: discord.Interaction, country: str, id_attachment: 
                 )
                 logging.error(f"Failed to assign role to {member.name} in {interaction.guild.name} due to an error: {e}")
                 await interaction.followup.send(embed=embed, ephemeral=True)
+
+        new_usage_count = usage_count + 1 if usage_count else 1
+        update_cooldown(interaction.user.id, interaction.guild.id, "verify", new_usage_count)
 
     except Exception as e:
         logging.error(f"An error occurred: {str(e)}")
